@@ -100,6 +100,7 @@ class LinearLayer():
         self.W_mu = Variable(torch.Tensor(d_out, d_in).type(dtype), requires_grad=True)
         # self.W_rho = Variable(torch.Tensor(d_in, d_out).type(dtype), requires_grad=True)
         self.b_mu = Variable(torch.Tensor(d_out).type(dtype), requires_grad=True)
+        self.reset_parameters()
         # self.b_rho = Variable(torch.Tensor(d_out).type(dtype), requires_grad=True)
         # self.W_sample = None
         # self.b_sample = None
@@ -110,7 +111,7 @@ class LinearLayer():
         return self.components
 
     def reset_parameters(self):
-        stdv = 1. / math.sqrt(self.weight.size(1))
+        stdv = 1. / math.sqrt(self.W_mu.size(1))
         self.W_mu.data.uniform_(-stdv, stdv)
         self.b_mu.data.uniform_(-stdv, stdv)
 
@@ -154,7 +155,7 @@ class LinearLayer():
 
 class DQN():
     def __init__(self):
-        D_in, H, D_out = 2, 8, 4
+        D_in, H, D_out = 2, 4, 4
 
         self.h1 = LinearLayer(D_in, H)
         self.h2 = LinearLayer(H, H)
@@ -363,7 +364,7 @@ for i_episode in range(num_episodes):
         # Perform one step of the optimization (on the target network)
         optimize_model()
         if done:
-            if i_episode % 2 == 0:
+            if i_episode % 100 == 0:
                 print "Iter {}, score: {}".format(i_episode, score)
             total_score_l.append(score)
             break
