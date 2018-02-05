@@ -136,24 +136,28 @@ class DQN(nn.Module):
 BATCH_SIZE = 64
 GAMMA = 1.0
 EPS_START = 1.0
-EPS_END = 0.001
+EPS_END = 0.01
 EPS_DECAY = 500
+TARGET_SYNC_ITERS = 1000
 
 model = DQN()
+target = deepcopy(model)
 
 if use_cuda:
     model.cuda()
 
 optimizer = optim.RMSprop(model.parameters())
-memory = ReplayMemory(1000)
+memory = ReplayMemory(10000)
 
 steps_done = 0
-
+last_ep = 0
 def select_action(state):
     global steps_done
+    global last_ep
     sample = random.random()
     eps_threshold = EPS_END + (EPS_START - EPS_END) * \
         math.exp(-1. * steps_done / EPS_DECAY)
+    last_ep = eps_threshold
     steps_done += 1
     if sample > eps_threshold:
         var = Variable(state, volatile=True).type(FloatTensor) 
@@ -184,6 +188,12 @@ last_sync = 0
 
 def optimize_model():
     global last_sync
+    global target
+    last_sync += 1
+    if last_sync == TARGET_SYNC_ITERS:
+        last_sync = 0
+        target = deepcopy(model)
+        print "target synced"
     if len(memory) < BATCH_SIZE:
         return
     transitions = memory.sample(BATCH_SIZE)
@@ -211,7 +221,7 @@ def optimize_model():
 
     # Compute V(s_{t+1}) for all next states.
     next_state_values = Variable(torch.zeros(BATCH_SIZE).type(Tensor))
-    next_state_values[non_final_mask] = model(non_final_next_states).max(1)[0]
+    next_state_values[non_final_mask] = target(non_final_next_states).max(1)[0]
     # Now, we don't want to mess up the loss with a volatile flag, so let's
     # clear it. After this, we'll just end up with a Variable that has
     # requires_grad=False
@@ -251,7 +261,7 @@ def policy_dump(env):
 
 total_score_l = []
 
-num_episodes = 2000
+num_episodes = 5000
 for i_episode in range(num_episodes):
     # Initialize the environment and state
     env.reset()
@@ -259,7 +269,7 @@ for i_episode in range(num_episodes):
     state = Tensor(env.get_state()).unsqueeze(0)
 
     score = 0
-    for t in xrange(500):
+    for t in xrange(50):
         # Select and perform an action
         action = select_action(state)
         reward, done = env.do_action(action[0, 0])
@@ -282,7 +292,7 @@ for i_episode in range(num_episodes):
         optimize_model()
         if done:
             if i_episode % 100 == 0:
-                print "Iter {}, score: {}".format(i_episode, score)
+                print "Iter {}\tscore: {}\tep: {}".format(i_episode, score, last_ep)
             total_score_l.append(score)
             break
 
@@ -291,4 +301,3 @@ N = 100
 averages = np.convolve(total_score_l, np.ones((N,))/N, mode='valid')
 plt.plot(xrange(len(averages)), averages)
 plt.show()
-
