@@ -68,6 +68,9 @@ class ReplayMemory(object):
     def sample(self, batch_size):
         return random.sample(self.memory, batch_size)
 
+    def shuffle(self):
+        random.shuffle(self.memory)
+
     def state_action_counts(self):
         freqs = defaultdict(lambda: defaultdict(int))
         for transition in self.memory:
@@ -159,8 +162,6 @@ class BBQN():
 #    episode.
 #
 
-
-
 steps_done = 0
 def select_action(model, state):
     var = Variable(state, volatile=True).type(FloatTensor) 
@@ -172,7 +173,7 @@ def get_Q(target, state):
     var = Variable(state, volatile=True).type(FloatTensor) 
     return target(var, mean_only=True).data
 
-def Q_dump(env, target):
+def Q_values(env, target):
     n = env.state_size()
     m = int(n ** 0.5)
     states = np.identity(n)
@@ -180,40 +181,27 @@ def Q_dump(env, target):
     for i, row in enumerate(states):
         state = Tensor(row).unsqueeze(0)
         Q[i] = get_Q(target, state)[0]
+    return Q
+
+def median_Q(env, target):
+    Q = Q_values(env, target)
+    return torch.median(Q)
+
+def Q_dump(env, target):
+    n = env.state_size()
+    m = int(n ** 0.5)
+    Q = Q_values(env, target)
     for i, row in enumerate(Q.t()):
         print "Action {}".format(i)
         print row.contiguous().view(m, m)
     
-
-######################################################################
-# Training loop
-# ^^^^^^^^^^^^^
-#
-# Finally, the code for training our model.
-#
-# Here, you can find an ``optimize_model`` function that performs a
-# single step of the optimization. It first samples a batch, concatenates
-# all the tensors into a single one, computes :math:`Q(s_t, a_t)` and
-# :math:`V(s_{t+1}) = \max_a Q(s_{t+1}, a)`, and combines them into our
-# loss. By defition we set :math:`V(s) = 0` if :math:`s` is a terminal
-# state.
-
-
-######################################################################
-#
-# Below, you can find the main training loop. At the beginning we reset
-# the environment and initialize the ``state`` variable. Then, we sample
-# an action, execute it, observe the next screen and the reward (always
-# 1), and optimize our model once. When the episode ends (our model
-# fails), we restart the loop.
-#
-
-def simulate(RHO_P, STD_DEV_P, BATCH_SIZE, GAMMA, TARGET_RESET_PERIOD, SAMPLE_PERIOD, NUM_EPISODES):
+def simulate(RHO_P, STD_DEV_P, BATCH_SIZE, GAMMA, TARGET_RESET_PERIOD, SAMPLE_PERIOD, NUM_EPISODES,
+                TRAIN_IN_EPOCHS, NUM_TARGET_RESET, NUM_EPOCHS):
     env = gym.make('gym_onehotgrid-v0').unwrapped
     model = BBQN(env.state_size(), env.num_actions(), RHO_P, bias=False)
     target = model.make_target()
     optimizer = optim.Adam(model.parameters())
-    memory = ReplayMemory(100000)
+    memory = ReplayMemory(2**15)
 
     last_sync = [0]
     loss_comp_dict = defaultdict(list)
@@ -221,7 +209,7 @@ def simulate(RHO_P, STD_DEV_P, BATCH_SIZE, GAMMA, TARGET_RESET_PERIOD, SAMPLE_PE
     sigma_average_dict = defaultdict(list)
     components = ['W']
     loss_average_l = []
-
+    median_q_l = []
     print RHO_P, STD_DEV_P
 
     def optimize_model(w_sample, model, target):
@@ -230,72 +218,107 @@ def simulate(RHO_P, STD_DEV_P, BATCH_SIZE, GAMMA, TARGET_RESET_PERIOD, SAMPLE_PE
         
         if last_sync[0] == TARGET_RESET_PERIOD:
             target = model.make_target()
+            median_q_l.append(median_Q(env, target))
             print "Target reset"
             # Q_dump(env, target)
             last_sync[0] = 0
         last_sync[0] += 1
 
-        transitions = memory.sample(BATCH_SIZE)
-        # Transpose the batch (see http://stackoverflow.com/a/19343/3343043 for
-        # detailed explanation).
-        batch = Transition(*zip(*transitions))
+        def loss_of_batch(batch):
+            # Compute a mask of non-final states and concatenate the batch elements
+            non_final_mask = ByteTensor(tuple(map(lambda s: s is not None,
+                                                  batch.next_state)))
 
-        # Compute a mask of non-final states and concatenate the batch elements
-        non_final_mask = ByteTensor(tuple(map(lambda s: s is not None,
-                                              batch.next_state)))
+            # We don't want to backprop through the expected action values and volatile
+            # will save us on temporarily changing the model parameters'
+            # requires_grad to False!
+            non_final_next_states = Variable(torch.cat([s for s in batch.next_state
+                                                        if s is not None]),
+                                             volatile=True)
+            state_batch = Variable(torch.cat(batch.state))
+            action_batch = Variable(torch.cat(batch.action))
+            reward_batch = Variable(torch.cat(batch.reward))
 
-        # We don't want to backprop through the expected action values and volatile
-        # will save us on temporarily changing the model parameters'
-        # requires_grad to False!
-        non_final_next_states = Variable(torch.cat([s for s in batch.next_state
-                                                    if s is not None]),
-                                         volatile=True)
-        state_batch = Variable(torch.cat(batch.state))
-        action_batch = Variable(torch.cat(batch.action))
-        reward_batch = Variable(torch.cat(batch.reward))
+            # Compute Q(s_t, a) - the model computes Q(s_t), then we select the
+            # columns of actions taken
+            state_action_values = model(state_batch).gather(1, action_batch).view(-1)
 
-        # Compute Q(s_t, a) - the model computes Q(s_t), then we select the
-        # columns of actions taken
-        state_action_values = model(state_batch).gather(1, action_batch)
+            # Compute V(s_{t+1}) for all next states.
+            next_state_values = Variable(torch.zeros(BATCH_SIZE).type(Tensor))
+            next_state_values[non_final_mask] = target(non_final_next_states, mean_only=True).max(1)[0]
+            # Now, we don't want to mess up the loss with a volatile flag, so let's
+            # clear it. After this, we'll just end up with a Variable that has
+            # requires_grad=False
+            next_state_values.volatile = False
+            # Compute the expected Q values
+            expected_state_action_values = (next_state_values * GAMMA) + reward_batch
 
-        # Compute V(s_{t+1}) for all next states.
-        next_state_values = Variable(torch.zeros(BATCH_SIZE).type(Tensor))
-        next_state_values[non_final_mask] = target(non_final_next_states, mean_only=True).max(1)[0]
-        # Now, we don't want to mess up the loss with a volatile flag, so let's
-        # clear it. After this, we'll just end up with a Variable that has
-        # requires_grad=False
-        next_state_values.volatile = False
-        # Compute the expected Q values
-        expected_state_action_values = (next_state_values * GAMMA) + reward_batch
+            loss_components = [0.0, 0.0, 0.0, 0.0]
+            # Compute l2 loss
+            loss_components[3] = (state_action_values - expected_state_action_values).pow(2).sum()
 
-        loss_components = [0.0, 0.0, 0.0, 0.0]
-        # Compute l2 loss
-        loss_components[3] = (state_action_values - expected_state_action_values).pow(2).sum()
+            #Now add log(q(w|theta)) - log(p(w)) terms
+            mu_l = model.get_mu_l()
+            sigma_l = model.get_sigma_l()
+            for i in range(len(w_sample)):
+                w = w_sample[i]
+                mu = mu_l[i]
+                sigma = sigma_l[i]
+                loss_components[0] -= torch.log(sigma).sum()
+                loss_components[1] += (w.pow(2)).sum() / (2.0 * (STD_DEV_P ** 2))
+                loss_components[2] -= ((w - mu).pow(2) / (2.0 * sigma.pow(2))).sum()
 
-        #Now add log(q(w|theta)) - log(p(w)) terms
-        mu_l = model.get_mu_l()
-        sigma_l = model.get_sigma_l()
-        for i in range(len(w_sample)):
-            w = w_sample[i]
-            mu = mu_l[i]
-            sigma = sigma_l[i]
-            loss_components[0] -= torch.log(sigma).sum()
-            loss_components[1] += (w.pow(2)).sum() / (2.0 * (STD_DEV_P ** 2))
-            loss_components[2] -= ((w - mu).pow(2) / (2.0 * sigma.pow(2))).sum()
+            for i in range(len(loss_components)-1):
+                loss_components[i] /= M
 
-        for i in range(len(loss_components)):
-            loss_comp_dict[loss_component_names[i]].append(loss_components[i].data[0])
+            for i in range(len(loss_components)):
+                loss_comp_dict[loss_component_names[i]].append(loss_components[i].data[0])
                     
-        loss = sum(loss_components)
-        loss_average_l.append(loss.data[0])
-        # Optimize the model
-        optimizer.zero_grad()
-        loss.backward()
-        # nn.utils.clip_grad_norm(model.parameters(), 1.0)
-        optimizer.step()
+            loss = sum(loss_components)
+            
+            return loss
+
+        def gradient_step(loss):
+            # Optimize the model
+            optimizer.zero_grad()
+            loss.backward()
+            # nn.utils.clip_grad_norm(model.parameters(), 1.0)
+            optimizer.step()
+
+        if TRAIN_IN_EPOCHS:
+            M = len(memory) / BATCH_SIZE
+            for target_iter in range(NUM_TARGET_RESET):
+                target = model.make_target()
+                memory.shuffle()
+                for epoch in range(NUM_EPOCHS):           
+                    for minibatch in range(M):
+                        start_idx = minibatch * BATCH_SIZE
+                        end_idx = start_idx + BATCH_SIZE
+                        transitions = memory.memory[start_idx:end_idx]
+                        w_sample = model.sample()
+                        # Transpose the batch (see http://stackoverflow.com/a/19343/3343043 for
+                        # detailed explanation).
+                        batch = Transition(*zip(*transitions))
+
+                        loss = loss_of_batch(batch)
+                        loss_average_l.append(loss.data[0])
+                        gradient_step(loss)
+        else:
+            transitions = memory.sample(BATCH_SIZE)
+            M = 1
+
+            # Transpose the batch (see http://stackoverflow.com/a/19343/3343043 for
+            # detailed explanation).
+            batch = Transition(*zip(*transitions))
+
+            loss = loss_of_batch(batch)
+            loss_average_l.append(loss.data[0])
+            gradient_step(loss)
+
         return model, target
     
     score_list = []
+    median_q_l = []
     for i_episode in range(NUM_EPISODES):
         # Initialize the environment and state
         env.reset()
@@ -307,7 +330,7 @@ def simulate(RHO_P, STD_DEV_P, BATCH_SIZE, GAMMA, TARGET_RESET_PERIOD, SAMPLE_PE
             do_update = False
             if iters % SAMPLE_PERIOD == 0:
                 w_sample = model.sample()
-                do_update = True
+                do_update = not TRAIN_IN_EPOCHS
             iters += 1
             
             # Select and perform an action
@@ -330,51 +353,28 @@ def simulate(RHO_P, STD_DEV_P, BATCH_SIZE, GAMMA, TARGET_RESET_PERIOD, SAMPLE_PE
             if do_update:
                 model, target = optimize_model(w_sample, model, target)
             if done:
-                score_list.append(score)
-                for idx, sigma in enumerate(model.get_sigma_l()):
-                    average = sigma.mean().data[0]
-                    sigma_average_dict[components[idx]].append(average)
-                if i_episode % 100 == 0:
-                    print "Episode: {}\tscore: {}".format(i_episode, score)
                 break
+
+        median_q_l.append(median_Q(env, target))
+        score_list.append(score)
+        for idx, sigma in enumerate(model.get_sigma_l()):
+            average = sigma.mean().data[0]
+            sigma_average_dict[components[idx]].append(average)
+        if i_episode % 100 == 0:
+            print "Episode: {}\tscore: {}".format(i_episode, score)
+        if TRAIN_IN_EPOCHS and i_episode % TRAIN_IN_EPOCHS_PERIOD == 0:
+            model, target = optimize_model(w_sample, model, target)
+
     print memory.state_action_counts()
     Q_dump(env, target)
     print model.get_mu_l()
     print model.get_sigma_l()
-
-    # N = 100
-    # averages = np.convolve(score_list, np.ones((N,))/N, mode='valid')
-    # plt.plot(xrange(len(averages)), averages)
-    # plt.show()
-
-    # handles = []
-    # N = 100
-    # for name, values in loss_comp_dict.iteritems():
-    #     averages = np.convolve(values, np.ones((N,))/N, mode='valid')
-    #     handle, = plt.plot(values, label=name)
-    #     handles.append(handle)
-    # plt.legend(handles=handles)
-    # plt.xlabel("Number of updates")
-    # plt.ylabel("Smoothed loss contribution")
-    # plt.title("Loss contribution by term versus number of updates")
-    # plt.savefig("ADAM_loss_contributions.png")
-    # plt.show()
-
-    # handles = []
-    # for name, values in sigma_average_dict.iteritems():
-    #     handle, = plt.plot(values, label=name)
-    #     handles.append(handle)
-    # plt.legend(handles=handles)
-    # plt.xlabel("Number of episodes")
-    # plt.ylabel("Mean of uncertainty in each layer")
-    # plt.title("Uncertainty versus episodes")
-    # plt.savefig("ADAM_decay_of_average_sigma.png")
-    # plt.show()
-
-    return sigma_average_dict['W'], loss_average_l
+    return sigma_average_dict['W'], loss_average_l, median_q_l, score_list
 
 handles = []
 loss_average_l = []
+median_q_l = []
+score_l = []
 # rho_l = [-3.0, -2.0, -1.0, 0., 1., 2.0]
 rho_l = [0.]
 for rho in rho_l:
@@ -382,17 +382,25 @@ for rho in rho_l:
     RHO_P = rho
     STD_DEV_P = math.log1p(math.exp(RHO_P))
 
-    BATCH_SIZE = 32
+    BATCH_SIZE = 256
     GAMMA = 0.999
-    TARGET_RESET_PERIOD = 10000
-    SAMPLE_PERIOD = 1
+    TARGET_RESET_PERIOD = 5000
+    SAMPLE_PERIOD = 5
     NUM_EPISODES = 10000
+
+    TRAIN_IN_EPOCHS = True
+    NUM_TARGET_RESET = 2
+    NUM_EPOCHS = 2
+    TRAIN_IN_EPOCHS_PERIOD = 50
     ### 
 
-    sigma_average, loss_average = simulate(RHO_P, STD_DEV_P, BATCH_SIZE, GAMMA, TARGET_RESET_PERIOD, SAMPLE_PERIOD, NUM_EPISODES)
-    handle, = plt.loglog(sigma_average, label="RHO={}".format(rho))
+    sigma_average, loss_average, median_q, score = simulate(RHO_P, STD_DEV_P, BATCH_SIZE, GAMMA, TARGET_RESET_PERIOD,\
+            SAMPLE_PERIOD, NUM_EPISODES, TRAIN_IN_EPOCHS, NUM_TARGET_RESET, NUM_EPOCHS)
+    handle, = plt.semilogy(sigma_average, label="RHO={}".format(rho))
     handles.append(handle)
     loss_average_l.append(loss_average)
+    median_q_l.append(median_q)
+    score_l.append(score)
 plt.legend(handles=handles)
 plt.xlabel("Number of episodes")
 plt.ylabel("Mean of uncertainty in each layer")
@@ -400,15 +408,39 @@ plt.title("Uncertainty versus episodes")
 plt.savefig("RHO_decay_of_average_sigma.png")
 plt.show()    
 
-# handles = []
-# N = 1000
-# for i, values in enumerate(loss_average_l):
-#     averages = np.convolve(values, np.ones((N,))/N, mode='valid')
-#     handle, = plt.plot(values, label="RHO={}".format(rho_l[i]))
-#     handles.append(handle)
-# plt.legend(handles=handles)
-# plt.xlabel("Number of updates")
-# plt.ylabel("Smoothed loss contribution")
-# plt.title("Loss contribution by term versus number of updates")
-# plt.savefig("RHO_loss_contributions.png")
-# plt.show()
+handles = []
+for i, values in enumerate(median_q_l):
+    handle, = plt.plot(values, label="RHO={}".format(rho_l[i]))
+    handles.append(handle)
+plt.legend(handles=handles)
+plt.xlabel("Number of target updates")
+plt.ylabel("Median Q value")
+plt.title("Growth of median Q value with target updates")
+plt.savefig("RHO_median_q_value.png")
+plt.show()
+
+handles = []
+N = 100
+for i, values in enumerate(loss_average_l):
+    averages = np.convolve(values, np.ones((N,))/N, mode='valid')
+    handle, = plt.plot(averages, label="RHO={}".format(rho_l[i]))
+    handles.append(handle)
+plt.legend(handles=handles)
+plt.xlabel("Number of updates")
+plt.ylabel("Smoothed Loss")
+plt.title("Loss versus number of updates")
+plt.savefig("RHO_loss.png")
+plt.show()
+
+handles = []
+N = 100
+for i, values in enumerate(score_l):
+    averages = np.convolve(values, np.ones((N,))/N, mode='valid')
+    handle, = plt.plot(averages, label="RHO={}".format(rho_l[i]))
+    handles.append(handle)
+plt.legend(handles=handles)
+plt.xlabel("Number of episodes")
+plt.ylabel("Score (Max 7)")
+plt.title("Score versus number of episodes")
+plt.savefig("RHO_score.png")
+plt.show()
